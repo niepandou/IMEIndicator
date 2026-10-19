@@ -1,0 +1,17 @@
+{
+  "duration": 1.6,
+  "always_on": false,
+  "margin_bottom": 38,
+  "opacity": 0.85,
+  "transparent_bg": false,
+  "follow_mouse_monitor": true,
+  "show_on_startup": true,
+  "show_on_mode_change": true,
+  "show_on_fullwidth_change": true,
+  "show_on_caps_change": false,
+  "show_on_window_change": false,
+  "show_fullwidth": true,
+  "poll_ms": 60,
+  "hook_hotkeys": true,
+  "fullscreen_policy": "pause"
+}

@@ -1,0 +1,60 @@
+# ============================================================
+# IME Indicator — 入库前排除清单
+# 仓库里只应该有：源码、文档、示例配置、启动脚本
+# ============================================================
+
+# ---------- 运行时生成：个人配置与日志 ----------
+# config.json 是你自己的设置（停留时长、透明度、各个开关…），不要提交。
+# 想贡献默认值请改 config.example.json。
+config.json
+config.json.tmp
+config.json.*.bak
+*.bak
+events.log
+crash.log
+*.log
+
+# ---------- 本地工作目录 ----------
+# 内含本地笔记与缓存，可能带有对话内容和机器信息，不上传
+.workbuddy/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ---------- 打包 / 虚拟环境 ----------
+*.spec
+*.manifest
+PyInstaller/
+venv/
+.venv/
+env/
+ENV/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 其他 ----------
+*.orig
+*.rej
