@@ -42,7 +42,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import tkinter.ttk as ttk
 
-VERSION = "7.2"
+VERSION = "8.3"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.abspath(__file__)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -59,6 +59,10 @@ _pid = os.getpid()
 # ==========================================================================
 DEFAULT_CONFIG = {
     "duration": 1.6,                  # 提示条停留秒数（非常驻模式）
+    # 游戏里的停留秒数。为什么单独一个：只要有一块可见窗口压在无边框全屏游戏上，
+    # DWM 就会取消游戏的"独立翻转"、改成合成（实测 72→55 FPS），所以在游戏里
+    # 停留越短，掉帧持续的时间越短。设成和 duration 一样就等于不缩短。
+    "game_duration": 1.0,
     "always_on": False,               # True = 常驻不自动隐藏
     "margin_bottom": 38,              # 距屏幕（工作区）底部距离
     "opacity": 0.85,                  # 整体不透明度
@@ -77,9 +81,13 @@ DEFAULT_CONFIG = {
     # 觉得费电可以调大到 100/200；打游戏时按全屏策略自动暂停。
     "poll_ms": 60,
     "hook_hotkeys": True,             # 监听 Alt+Shift 等切换键，命中后立即加速轮询
-    # 独占全屏（游戏）时的策略：
-    #   pause  = 完全静默，零干扰（默认；独占全屏下提示条本来也会被遮挡）
-    #   reduce = 降频到 0.6s 且不做前台查询，仍提示（无边框/窗口化游戏用）
+    # 学到的"这个输入法会不会自己上报全角位"，键是 HKL（如 "08040804"）。
+    # 微软拼音不上报（全角时转换模式仍是 0x401），搜狗上报（0x409）。
+    # 运行时会自动学，存在这里，下次启动不用重学。
+    "ime_caps": {},
+    # 全屏/无边框游戏时的策略（全屏判定 = 通知状态 + 窗口几何，见 detect_fullscreen）：
+    #   pause  = 完全静默：停止采样、卸掉键盘钩子、收起提示条（默认，零干扰零卡顿）
+    #   reduce = 降频到 0.6s 仍提示（无边框/窗口化游戏用；钩子同样卸掉）
     #   normal = 与普通窗口一样
     "fullscreen_policy": "pause",
 }
@@ -178,7 +186,10 @@ IME_CMODE_NATIVE = 0x0001
 IME_CMODE_FULLSHAPE = 0x0008
 SMTO_ABORTIFHUNG = 0x0002
 
-GWL_EXSTYLE = -20
+GWL_STYLE, GWL_EXSTYLE = -16, -20
+WS_CAPTION = 0x00C00000
+WS_POPUP = 0x80000000
+WS_EX_WINDOWEDGE = 0x00000100
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_LAYERED = 0x00080000
 WS_EX_TOOLWINDOW = 0x00000080
@@ -186,6 +197,7 @@ WS_EX_NOACTIVATE = 0x08000000
 MONITOR_DEFAULTTONEAREST = 2
 
 WH_KEYBOARD_LL = 13
+WM_QUIT = 0x0012
 WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
 WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
 VK_SHIFT, VK_CONTROL, VK_MENU, VK_SPACE, VK_LWIN = 0x10, 0x11, 0x12, 0x20, 0x5B
@@ -247,6 +259,19 @@ imm32.ImmGetDefaultIMEWnd.argtypes = [LPVOID]
 
 kernel32.GetModuleHandleW.restype = LPVOID
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+
+user32.GetWindowRect.argtypes = [LPVOID, ctypes.POINTER(wt.RECT)]
+user32.MonitorFromWindow.restype = LPVOID
+user32.MonitorFromWindow.argtypes = [LPVOID, ctypes.c_ulong]
+user32.GetMonitorInfoW.restype = _BOOL
+user32.GetMonitorInfoW.argtypes = [LPVOID, ctypes.c_void_p]
+user32.IsZoomed.argtypes = [LPVOID]
+user32.IsWindowVisible.argtypes = [LPVOID]
+user32.PostThreadMessageW.restype = _BOOL
+user32.PostThreadMessageW.argtypes = [ctypes.c_ulong, ctypes.c_uint,
+                                      ctypes.c_size_t, ctypes.c_size_t]
+kernel32.GetCurrentThreadId.restype = ctypes.c_ulong
+kernel32.GetCurrentThreadId.argtypes = []
 
 
 def window_class(hwnd):
@@ -431,102 +456,128 @@ def focused_control(hwnd):
     return hwnd
 
 
-def _imm_read(hwnd):
-    """单窗口一次 IMM 读数 -> (open_status, conv)，取不到的那个是 None"""
-    open_status = None
-    conv = None
+IME_TIMEOUT_MS = 60        # 单条 WM_IME_CONTROL 超时；游戏窗口实测 ≤18ms
+IME_RETRY_MS = 12          # 焦点控件读不到时换顶层窗口重试的上限
+
+
+def ime_window(hwnd):
+    if not hwnd:
+        return None
     try:
-        himc = imm32.ImmGetContext(hwnd)
+        return imm32.ImmGetDefaultIMEWnd(hwnd) or None
     except Exception:
-        himc = None
-    if himc:
-        try:
-            open_status = bool(imm32.ImmGetOpenStatus(himc))
-            cmode = ctypes.c_ulong(0)
-            smode = ctypes.c_ulong(0)
-            if imm32.ImmGetConversionStatus(himc, ctypes.byref(cmode),
-                                            ctypes.byref(smode)):
-                conv = cmode.value
-        except Exception:
-            conv = None
-        finally:
-            try:
-                imm32.ImmReleaseContext(hwnd, himc)
-            except Exception:
-                pass
+        return None
+
+
+def _send_ime(hime, code, timeout_ms):
+    """问 IME 一个 WM_IME_CONTROL 子命令 -> (成功?, 值)
+
+    **只认 SendMessageTimeout 的返回值**：英文状态的转换模式本来就是 0，
+    拿返回值判断成功会永远读成英文（ImeModePersistence 的 ime_interop.cpp
+    里也专门写了这一条）。
+    """
+    res = ctypes.c_size_t(0)
+    try:
+        ok = user32.SendMessageTimeoutW(hime, WM_IME_CONTROL, code, None,
+                                        SMTO_ABORTIFHUNG,
+                                        max(1, int(timeout_ms)),
+                                        ctypes.byref(res))
+    except Exception:
+        return False, 0
+    return bool(ok), int(res.value) & 0xFFFFFFFF
+
+
+def ime_query(hwnd, timeout_ms=IME_TIMEOUT_MS):
+    """问一次该窗口的 IME -> (open_status, conv_mode)，没取到的项是 None"""
+    hime = ime_window(hwnd)
+    if not hime:
+        return None, None
+    ok_open, opened = _send_ime(hime, IMC_GETOPENSTATUS, timeout_ms)
+    ok_conv, conv = _send_ime(hime, IMC_GETCONVERSIONMODE, timeout_ms)
+    return (bool(opened) if ok_open else None), (conv if ok_conv else None)
+
+
+class Reading:
+    """一次采样的完整结果。
+
+    cn 为 None 表示"这次没读到"，**不是**英文。上层拿到 None 时必须保持
+    上一次的状态，绝不能当成一次变化 —— 这是启动/游戏中乱刷的根源。
+    """
+    __slots__ = ("hwnd", "langid", "hkl", "cn", "full", "caps", "ok",
+                 "source", "ms", "conv", "open_status")
+
+    def __init__(self, hwnd=None, langid=0, hkl=0, cn=None, full=None,
+                 caps=False, ok=False, source="none", ms=0.0,
+                 conv=None, open_status=None):
+        self.hwnd = hwnd
+        self.langid = langid
+        self.hkl = hkl
+        self.cn = cn
+        self.full = full
+        self.caps = caps
+        self.ok = ok
+        self.source = source
+        self.ms = ms
+        self.conv = conv              # IME 原始转换模式（诊断用）
+        self.open_status = open_status
+
+    def get(self, k, default=None):
+        return getattr(self, k, default)
+
+    def __repr__(self):
+        return ("Reading(cn=%r full=%r langid=0x%04X src=%s %.2fms)"
+                % (self.cn, self.full, self.langid, self.source, self.ms))
+
+
+def read_state(hwnd=None, timeout_ms=IME_TIMEOUT_MS):
+    """采一次前台输入状态 -> Reading"""
+    t0 = time.perf_counter()
+
+    def cost():
+        return (time.perf_counter() - t0) * 1000
+
+    if hwnd is None:
+        hwnd = foreground_window()
+    if not hwnd:
+        return Reading(source="no-window", ms=cost())
+
+    try:
+        tid = user32.GetWindowThreadProcessId(hwnd, None)
+        hkl = int(user32.GetKeyboardLayout(ctypes.c_ulong(tid or 0)) or 0)
+    except Exception:
+        hkl = 0
+    langid = hkl & 0xFFFF
+
+    # ① 语言层就够用的情形：英语/日语等键盘上根本没有"中文开关"。
+    #    直接判定，一次跨进程调用都不发 —— 游戏里就是靠这条做到零开销。
+    if langid and not is_chinese_layout(langid):
+        return Reading(hwnd, langid, hkl, False, None, False, True,
+                       "layout", cost())
+
+    # ② 中文布局：问 IME。先问焦点控件（IME 状态挂在它所在线程上）。
+    focus = focused_control(hwnd)
+    target = focus or hwnd
+    open_status, conv = ime_query(target, timeout_ms)
+    if conv is None and target != hwnd:
+        # 焦点控件常常在另一个线程（浏览器渲染进程等），换顶层再试一次。
+        # 超时收紧，避免慢目标把一次采样拖成两倍。
+        open_status, conv = ime_query(hwnd, min(timeout_ms, IME_RETRY_MS))
     if conv is None:
-        # 回退路径：问输入法自己的默认窗口。用 SendMessageTimeout +
-        # ABORTIFHUNG，前台是全速渲染的游戏时最多等 10ms 就放弃，
-        # 不会把它的消息循环堵住（同步 SendMessage 会，表现为掉帧）。
-        try:
-            hime = imm32.ImmGetDefaultIMEWnd(hwnd)
-        except Exception:
-            hime = None
-        if hime:
-            res = ctypes.c_size_t(0)
-            try:
-                ok = user32.SendMessageTimeoutW(hime, WM_IME_CONTROL,
-                                                IMC_GETCONVERSIONMODE, None,
-                                                SMTO_ABORTIFHUNG, 10,
-                                                ctypes.byref(res))
-            except Exception:
-                ok = 0
-            if ok:
-                # conv == 0（英文 + 半角）是**合法值**，不能当成"没取到"，
-                # 否则英文状态会退化成"未知"。
-                conv = res.value
-                res2 = ctypes.c_size_t(0)
-                try:
-                    if user32.SendMessageTimeoutW(hime, WM_IME_CONTROL,
-                                                  IMC_GETOPENSTATUS, None,
-                                                  SMTO_ABORTIFHUNG, 10,
-                                                  ctypes.byref(res2)):
-                        open_status = bool(res2.value)
-                except Exception:
-                    pass
-    return open_status, conv
+        return Reading(hwnd, langid, hkl, None, None, False, False,
+                       "timeout", cost())
+
+    native = bool(conv & IME_CMODE_NATIVE)
+    # 微软拼音：中文 open=1 conv=0x401；英文 open=1 conv=0 → 必须两个一起看
+    cn = (bool(open_status) and native) if open_status is not None else native
+    return Reading(hwnd, langid, hkl, cn, bool(conv & IME_CMODE_FULLSHAPE),
+                   False, True, "ime", cost(),
+                   conv=conv, open_status=open_status)
 
 
 def read_ime_state(hwnd=None, retry=True):
-    """-> (是否中文, 是否全角, 是否读到可靠值)
-
-    第一项为 None 表示"这次没读到"（不是英文），全角同理。
-    """
-    if hwnd is None:
-        hwnd = user32.GetForegroundWindow()
-    if not hwnd:
-        return None, None, False
-
-    fc = focused_control(hwnd)
-    targets = [fc] if fc else []
-    if hwnd not in targets:
-        targets.append(hwnd)
-
-    tries = 2 if retry else 1
-    last_open = None
-    for i in range(tries):
-        for t in targets:
-            open_status, conv = _imm_read(t)
-            if open_status is not None:
-                last_open = open_status
-            if conv is not None:
-                native = bool(conv & IME_CMODE_NATIVE)
-                if open_status is None:
-                    cn = native          # 没拿到开关状态就只看转换模式
-                else:
-                    cn = bool(open_status) and native
-                return cn, bool(conv & IME_CMODE_FULLSHAPE), True
-        if i + 1 < tries:
-            # 鼠标点语言栏的瞬间焦点会短暂离开原窗口，hwndFocus 可能为空，
-            # 不重试的话这次切换就整个漏掉了（"用鼠标切没反应"）。
-            time.sleep(0.03)
-            fc2 = focused_control(hwnd)
-            if fc2 and fc2 not in targets:
-                targets.insert(0, fc2)
-
-    if last_open is not None:
-        return (True if last_open else False), None, False
-    return None, None, False
+    """旧接口（--once / --debug）：-> (cn, full, ok)"""
+    r = read_state(hwnd)
+    return r.cn, r.full, r.ok
 
 
 def caps_lock_on():
@@ -535,12 +586,25 @@ def caps_lock_on():
 
 # --------------------------------------------------------------------------
 # 全屏 / 游戏检测
+#
+# SHQueryUserNotificationState 只有**独占** D3D 全屏才稳定返回 3；无边框全屏
+# 一般返回 2（QUNS_BUSY）。而 2 会被 NVIDIA 覆盖层、某些 Electron 窗口误报
+# （PowerToys 刚为此把这两种状态拆成两个开关），所以 2 只能当"疑似"，还要
+# 有几何证据。判据：
+#   * 3/4（独占全屏 / 演示模式）        → 全屏
+#   * 窗口矩形贴满所在显示器且没有标题栏 → 全屏（无边框全屏）
+#
+# 几何判定的 DPI 坑：本进程不是 per-monitor DPI aware 时 GetWindowRect 和
+# GetMonitorInfo 都落在同一套虚拟化坐标里，直接比是安全的；而
+# DwmGetWindowAttribute(EXTENDED_FRAME_BOUNDS) 返回的是物理像素（本机实测
+# 2560×1440 vs 2048×1152），混用会永远判不出来 —— 所以这里只用前两个。
 # --------------------------------------------------------------------------
-QUNS_BUSY, QUNS_D3D_FULLSCREEN, QUNS_PRESENTATION = 2, 3, 4
+QUNS_NOT_PRESENT, QUNS_BUSY, QUNS_D3D_FULLSCREEN = 1, 2, 3
+QUNS_PRESENTATION, QUNS_ACCEPTS, QUNS_QUIET, QUNS_APP = 4, 5, 6, 7
 
 
 def query_notification_state():
-    """SHQueryUserNotificationState：2=忙碌 3=全屏3D 4=演示模式 5=正常"""
+    """1=未使用 2=忙碌(全屏/演示) 3=独占全屏 4=演示模式 5=正常 6=静默 7=应用"""
     try:
         shell32.SHQueryUserNotificationState.restype = ctypes.c_long
         shell32.SHQueryUserNotificationState.argtypes = [
@@ -550,11 +614,78 @@ def query_notification_state():
             return st.value
     except Exception:
         pass
-    return 5
+    return QUNS_ACCEPTS
 
 
-def is_fullscreen_state(st):
-    return st in (QUNS_BUSY, QUNS_D3D_FULLSCREEN, QUNS_PRESENTATION)
+def monitor_rect(hwnd):
+    """窗口所在显示器的**整块**矩形（不是工作区）"""
+    try:
+        hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not hmon:
+            return None
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            r = mi.rcMonitor
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
+
+
+def window_rect(hwnd):
+    try:
+        r = wt.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
+
+
+def covers_monitor(hwnd, tol=2, ratio=0.98):
+    """窗口是否贴满所在显示器（无边框全屏的几何特征）"""
+    if not hwnd or is_noise_window(hwnd):
+        return False
+    try:
+        if not user32.IsWindowVisible(hwnd):
+            return False
+        style = int(user32.GetWindowLongPtrW(hwnd, GWL_STYLE))
+        ex = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    except Exception:
+        style, ex = 0, 0
+    if ex & WS_EX_TOOLWINDOW:
+        return False
+    # 有标题栏 = 普通最大化窗口；无边框全屏一定没有标题栏
+    if (style & WS_CAPTION) == WS_CAPTION:
+        return False
+    wr, mr = window_rect(hwnd), monitor_rect(hwnd)
+    if not wr or not mr:
+        return False
+    mw, mh = mr[2] - mr[0], mr[3] - mr[1]
+    if mw <= 0 or mh <= 0:
+        return False
+    if abs(wr[0] - mr[0]) > tol or abs(wr[1] - mr[1]) > tol:
+        return False
+    ix = min(wr[2], mr[2]) - max(wr[0], mr[0])
+    iy = min(wr[3], mr[3]) - max(wr[1], mr[1])
+    if ix <= 0 or iy <= 0:
+        return False
+    return ix * iy >= ratio * mw * mh
+
+
+def detect_fullscreen(hwnd=None):
+    """-> (是否全屏, 原因字符串)；原因会写进日志，方便排查误判"""
+    hwnd = hwnd or foreground_window()
+    quns = query_notification_state()
+    if quns in (QUNS_D3D_FULLSCREEN, QUNS_PRESENTATION):
+        return True, "quns%d" % quns
+    if covers_monitor(hwnd):
+        return True, "geometry"
+    if quns == QUNS_BUSY and covers_monitor(hwnd, tol=48, ratio=0.90):
+        # 通知状态说忙、几何也基本贴满（放宽到 90%），才算
+        return True, "quns2+geometry"
+    return False, "no"
 
 
 # ==========================================================================
@@ -723,6 +854,12 @@ class Indicator:
         # 为"点了设置没反应"。打开子窗口前把主窗口设为"已映射但全透明"。
         self.pinned = False
         self.visible = False
+        self._geo = None          # 上一次的窗口几何，未变化就不再 SetWindowPos
+        self._alpha = None        # 上一次设置的 alpha
+        self._fade = True         # 游戏里关掉淡出
+        self._in_game = False     # 当前是否在全屏游戏里（决定用 game_duration）
+        self._fixed_w = self._fixed_width()
+        self.resize(self._fixed_w)
         self.root.update_idletasks()
         self._set_click_through()
         self.apply_transparent_bg()
@@ -783,6 +920,34 @@ class Indicator:
         self.cv.coords(self.panel, 0, 0, w, self.h)
         self.cv.coords(self.frame, 1, 1, w - 2, self.h - 2)
 
+    def _fixed_width(self):
+        """一次算好所有状态里最宽的那个，之后永不再改窗口宽度。
+
+        每次 show 都 resize 会重建 DWM 的重定向表面，在游戏里就是一次卡顿。
+        """
+        x2 = 26 + self.big_slot + 20
+        best = 248
+        for l1 in ("中文输入", "英文 · 输入法内", "英文 · 英语键盘", "状态未知"):
+            for l2 in ("● 全角", "半角", "角标未知", "无全角",
+                       "● 全角 · 大写锁定", "无全角 · 大写锁定", ""):
+                tw = max(self.f_l1.measure(l1),
+                         self.f_l2.measure(l2) if l2 else 0)
+                best = max(best, int(x2 + tw + 24))
+        return best
+
+    def set_fade(self, on):
+        """游戏里关掉淡出：每一帧 alpha 变化都是一次 DWM 更新"""
+        self._fade = bool(on)
+
+    def _apply_alpha(self):
+        want = float(self.cfg.get("opacity", 0.85))
+        if self._alpha is None or abs(self._alpha - want) > 1e-3:
+            try:
+                self.root.attributes("-alpha", want)
+            except Exception:
+                pass
+            self._alpha = want
+
     def place(self):
         w, h = self.w, self.h
         if self.cfg.get("follow_mouse_monitor", True):
@@ -794,6 +959,10 @@ class Indicator:
             bottom = user32.GetSystemMetrics(1)
         x = left + (right - left - w) // 2
         y = bottom - h - int(self.cfg.get("margin_bottom", 38))
+        # 位置没变就别再 SetWindowPos：移动一次就是一次 DWM 重排
+        if self._geo == (x, y, w, h):
+            return
+        self._geo = (x, y, w, h)
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
     # ---------- 显示 ----------
@@ -838,8 +1007,8 @@ class Indicator:
 
         x2 = 26 + self.big_slot + 20
         tw = max(self.f_l1.measure(l1), self.f_l2.measure(l2) if l2 else 0)
-        # 宽度对所有状态取同一个下限，避免切换时窗口左右跳
-        self.resize(max(248, int(x2 + tw + 24)))
+        # 宽度在启动时就算成固定值，show 里不再改窗口大小
+        self.resize(self._fixed_w)
 
         self.cv.coords(self.t_big_s, 27, 50)
         self.cv.coords(self.t_big, 26, 49)
@@ -861,8 +1030,11 @@ class Indicator:
 
         self.place()
         self.visible = True
-        self.root.deiconify()
-        self.root.lift()
+        try:
+            if self.root.state() == "withdrawn":
+                self.root.deiconify()
+        except Exception:
+            pass
         if self.hide_job:
             try:
                 self.root.after_cancel(self.hide_job)
@@ -877,10 +1049,7 @@ class Indicator:
             except Exception:
                 pass
             self.fade_job = None
-        try:
-            self.root.attributes("-alpha", float(self.cfg.get("opacity", 0.85)))
-        except Exception:
-            pass
+        self._apply_alpha()
         self.reschedule_hide()
 
     def reschedule_hide(self):
@@ -891,12 +1060,45 @@ class Indicator:
                 pass
             self.hide_job = None
         if not self.always_on:
-            self.hide_job = self.root.after(
-                int(float(self.cfg.get("duration", 1.6)) * 1000), self.fade_out)
+            dur = float(self.cfg.get("duration", 1.6))
+            if getattr(self, "_in_game", False):
+                # 游戏里少停留一会儿：这段时间正是 DWM 在合成、帧数被拖低的时段
+                dur = min(dur, float(self.cfg.get("game_duration", 1.0)))
+            self.hide_job = self.root.after(int(dur * 1000), self.fade_out)
+
+    def hide_now(self):
+        """立刻收起：不走淡出、不写 alpha，直接 withdraw。
+
+        游戏模式下这就是唯一的收场方式 —— 淡出每一步都在改 alpha，
+        每一步都是一次 DWM 更新。
+        """
+        for attr in ("hide_job", "fade_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.visible = False
+        self._alpha = 0.0
+        if not self.pinned:
+            try:
+                self.root.withdraw()
+            except Exception:
+                pass
+        else:
+            try:
+                self.root.attributes("-alpha", 0.0)
+            except Exception:
+                pass
 
     def fade_out(self):
         self.hide_job = None
         if self.always_on:
+            return
+        if not getattr(self, "_fade", True):
+            self.hide_now()
             return
         try:
             self._fade(float(self.cfg.get("opacity", 0.85)))
@@ -907,12 +1109,19 @@ class Indicator:
         a -= 0.12
         self.fade_job = None
         if a <= 0.02:
-            self.root.attributes("-alpha", 0.0)
+            try:
+                self.root.attributes("-alpha", 0.0)
+            except Exception:
+                pass
+            self._alpha = 0.0
             self.visible = False
             if not self.pinned:
                 self.root.withdraw()
             return
-        self.root.attributes("-alpha", a)
+        try:
+            self.root.attributes("-alpha", a)
+        except Exception:
+            pass
         self.fade_job = self.root.after(26, lambda: self._fade(a))
 
 
@@ -1238,17 +1447,49 @@ class SwitchKeyHook:
         self.on_combo = on_combo
         self.on_shift_space = on_shift_space
         self.proc = None
-        threading.Thread(target=self._run, daemon=True).start()
+        self._hook = None
+        self._thread = None
+        self._tid = 0
+        self._ready = threading.Event()
+        self.start()
+
+    # 全屏游戏里要能卸掉：钩子存在时的按键延迟是实打实的输入延迟
+    def is_running(self):
+        return bool(self._thread and self._thread.is_alive() and self._tid)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._ready.wait(0.35)
+
+    def stop(self):
+        tid = self._tid
+        self._tid = 0
+        if tid:
+            try:
+                user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+            except Exception:
+                pass
+        t = self._thread
+        if t and t.is_alive():
+            t.join(0.2)
 
     def _run(self):
+        self._tid = kernel32.GetCurrentThreadId()
         try:
             HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
                                           ctypes.c_size_t, ctypes.c_size_t)
 
             def proc(ncode, wparam, lparam):
                 try:
-                    if ncode >= 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN,
-                                                 WM_KEYUP, WM_SYSKEYUP):
+                    # 只在**按下**时处理：松开时也会收到 WM_KEYUP，而那时
+                    # Shift 通常还按着，组合键条件依然成立。实测一次
+                    # Shift+Space 会触发两遍 on_shift_space，把全角推断
+                    # 翻两次、正好抵消 —— 表现为"全角永远判反"。
+                    if ncode >= 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                         kb = ctypes.cast(
                             lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                         vk = kb.vkCode
@@ -1267,25 +1508,34 @@ class SwitchKeyHook:
                             self.on_combo()
                         if combo and vk == VK_SPACE and down(VK_SHIFT) \
                                 and not down(VK_LWIN) and self.on_shift_space:
-                            # 有些输入法（豆包）切全角不写 IMM 状态位，
-                            # 只能靠这个按键兜底推断，详见 App._resolve_full
+                            # 有些输入法（微软拼音、豆包）切全角不写 IMM 状态位，
+                            # 只能靠这个按键推断，详见 FullWidthTracker
                             self.on_shift_space()
                 except Exception:
                     pass
                 return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
             self.proc = HOOKPROC(proc)
-            h = user32.SetWindowsHookExW(
+            self._hook = user32.SetWindowsHookExW(
                 WH_KEYBOARD_LL, ctypes.cast(self.proc, ctypes.c_void_p),
                 kernel32.GetModuleHandleW(None), 0)
-            if not h:
+            self._ready.set()
+            if not self._hook:
                 return
             msg = wt.MSG()
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
+            try:
+                user32.UnhookWindowsHookEx(self._hook)
+            except Exception:
+                pass
+            self._hook = None
         except Exception:
             log_crash("键盘钩子", traceback.format_exc())
+        finally:
+            self._ready.set()
+            self._tid = 0
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -1486,6 +1736,232 @@ class SettingsWindow:
 
 
 # ==========================================================================
+# 全角 / 半角
+#
+# IME_CMODE_FULLSHAPE(0x8) 不是所有输入法都上报（实测/资料一致）：
+#   * 搜狗：半角 0x401、全角 0x409        → 能直接读
+#   * 微软拼音：两种宽度都是 0x401       → 不上报，只能靠 Shift+Space 推断
+#   * InputTip 干脆不显示全角（issue #77 至今开着）
+# 所以这里做"每个 HKL 学一次"：按下 Shift+Space 后 1.2 秒内看这一位有没有
+# 跟着翻。翻了 → 这个输入法会报（以后直接读）；没翻 → 不会报（以后用推断
+# 值，直到下次再按）。学到的结果存进 config["ime_caps"]，下次启动不用重学。
+#
+# 注意：钩子只在**按下**时触发一次。上一版连 WM_KEYUP 也处理，一次按键会
+# 触发两遍、把推断翻两次正好抵消 —— 这是"全角永远判反"的直接原因。
+# ==========================================================================
+class FullWidthTracker:
+    VERIFY_S = 1.2
+
+    def __init__(self, cfg, on_learn=None):
+        self.on_learn = on_learn
+        self.caps = {}
+        for k, v in (cfg.get("ime_caps") or {}).items():
+            self.caps[str(k).upper()] = bool(v)
+        self.infer = None        # (hkl, value)  Shift+Space 推出的值（粘性）
+        self.pending = None      # (hkl, hwnd, 期望值, ts) 刚按过，等这一位翻
+
+    @staticmethod
+    def key(hkl):
+        return "%08X" % (int(hkl) & 0xFFFFFFFF)
+
+    def _learn(self, k, capable):
+        if not k or self.caps.get(k) is capable:
+            return
+        self.caps[k] = capable
+        if self.on_learn:
+            self.on_learn(dict(self.caps))
+
+    def resolve(self, r):
+        """imm 上报的全角位 + Shift+Space 推断 -> 最终显示的布尔值（或 None）
+
+        **只在"刚按过 Shift+Space"的上下文里学习**。以前还加了一条"看到这一位
+        翻过就认为会上报"，结果被窗口切换坑了：IME 的转换状态是按线程存的，
+        切到另一个窗口 `conv` 自然不同，位就"翻"了 —— 于是把不上报的输入法
+        误判成上报，之后按 Shift+Space 不再推断，彻底没有反馈。
+        """
+        langid = r.langid or 0
+        if langid and not is_chinese_layout(langid):
+            self.pending = None
+            return None                      # 英语键盘没有全角这回事
+        k = self.key(r.hkl) if r.hkl else ""
+        bit = r.full if r.ok else None
+        now = time.time()
+
+        if self.pending and bit is not None:
+            pk, phwnd, expect, before, at = self.pending
+            if r.hwnd != phwnd:
+                # 验证期间换了窗口：读数来自另一线程，不能拿来判定，直接作废
+                self.pending = None
+            elif pk == k:
+                # 只有"这一位真的翻到了期望值"才算会上报。
+                # before 是按下那一刻的**原始位**（不是推断值），否则
+                # "本来就是半角、期望也是半角"会被误判成"跟着翻了"。
+                if before is not None and bit == expect and bit != before:
+                    self._learn(k, True)     # 这一位跟着翻了 → 会上报
+                    self.infer = None
+                    self.pending = None
+                elif now - at > self.VERIFY_S:
+                    # 按过了、这一位没动 → 不上报；推断值就是真相
+                    self._learn(k, False)
+                    self.pending = None
+                    if self.infer is None:
+                        self.infer = (k, expect)
+
+        if self.infer and k and self.infer[0] != k:
+            self.infer = None                # 换了键盘布局，旧推断作废
+
+        if k and self.infer and self.infer[0] == k:
+            if self.caps.get(k) is False:
+                return self.infer[1]         # 确认不上报，用推断值
+            if self.caps.get(k) is None:
+                return self.infer[1]         # 还没学出来，先用推断值顶着
+        return bit
+
+    def toggle(self, r):
+        """Shift+Space：翻转当前值 -> 新的显示值（None = 这次先不猜）
+
+        * 确认会上报的输入法：不猜，等下一次采样读真值（几十毫秒）。
+          但会挂一个 1.2s 的验证：真值没来就改判成"不上报"并补显示，
+          所以学错了也能自己恢复。
+        * 其他情况：先按翻转显示，再在 1.2s 内验证。
+        """
+        if not r or not is_chinese_layout(r.langid or 0):
+            return None
+        k = self.key(r.hkl)
+        raw = (bool(r.conv & IME_CMODE_FULLSHAPE)
+               if r.conv is not None else None)
+        # 翻转的基准是**用户当前看到的值**（可能来自推断），不是原始位；
+        # raw 只用于判断"这一位有没有真的跟着翻"。
+        base = r.full
+        if base is None:
+            base = raw if raw is not None else self.resolve(r)
+        val = (not base) if base is not None else True
+        self.pending = (k, r.hwnd, val, raw, time.time())
+        if self.caps.get(k) is True:
+            return None
+        self.infer = (k, val)
+        return val
+
+
+# ==========================================================================
+# 状态去抖
+#
+# 新应用启动那几百毫秒里，会连续出现「读不到 → 中文 → 读不到 → 英文」这类
+# 瞬态；游戏窗口里的跨进程读取更是随机失败。照着每次采样去比较并弹窗，
+# 就会连弹好几下（"UI 异常刷新多次"）。这里的规则：
+#   * 读不到（cn is None）的采样直接丢掉，绝不当作一次变化；
+#   * 候选状态要连续稳定 SETTLE 秒、且至少被看到 2 次才算数；
+#   * 换窗口（Alt+Tab 会连换好几个 hwnd）后 GRACE 秒内不弹；
+#   * 只和"上一次真正弹出去的状态"比，不和上一次采样比；
+#   * 两次弹出至少隔 MIN_GAP，快速抖动会被合并掉。
+# InputTip 的做法同类：候选状态要间隔 200ms 被看到两次，换窗口后 200ms 内忽略。
+# ==========================================================================
+class StateTracker:
+    SETTLE = 0.20
+    GRACE = 0.25
+    MIN_GAP = 0.15
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.hwnd = None
+        self.committed = None
+        self.pending = None
+        self.pending_since = 0.0
+        self.pending_n = 0
+        self.grace_until = 0.0
+        self.window_event = False
+        self.last_show = 0.0
+        self.ever = False
+
+    def soft_reset(self, now, grace=0.35):
+        """从全屏游戏切回来：给一段静默期，别把游戏里的残留状态弹出来"""
+        self.pending = None
+        self.pending_n = 0
+        self.grace_until = max(self.grace_until, now + grace)
+
+    def note(self, sig, now):
+        """手动弹过一次（Shift+Space 推断 / 预览）后同步状态机，避免重复再弹"""
+        self.committed = sig
+        self.pending = sig
+        self.pending_since = now
+        self.pending_n = 2
+        self.last_show = now
+
+    def _allowed(self, kind):
+        if kind == "startup":
+            return bool(self.cfg.get("show_on_startup", True))
+        if kind == "mode":
+            return bool(self.cfg.get("show_on_mode_change", True))
+        if kind == "full":
+            return bool(self.cfg.get("show_on_fullwidth_change", True))
+        if kind == "caps":
+            return bool(self.cfg.get("show_on_caps_change", False))
+        if kind == "window":
+            return bool(self.cfg.get("show_on_window_change", False))
+        return True
+
+    def feed(self, sig, hwnd, now):
+        """sig=(cn, full, caps, langid) -> (kind, sig) 或 None"""
+        if sig is None or sig[0] is None:
+            return None                     # 没读到：不产生任何状态
+
+        if hwnd != self.hwnd:
+            self.hwnd = hwnd
+            self.grace_until = now + self.GRACE
+            self.pending = None
+            self.pending_n = 0
+            self.window_event = bool(self.cfg.get("show_on_window_change"))
+
+        if sig != self.pending:
+            self.pending = sig
+            self.pending_since = now
+            self.pending_n = 1
+        else:
+            self.pending_n += 1
+
+        if now < self.grace_until:
+            return None
+        if self.pending_n < 2 or (now - self.pending_since) < self.SETTLE:
+            return None
+
+        if sig == self.committed:
+            # 状态没变；只有"换窗口提示"开着时才补弹一次
+            if self.window_event:
+                self.window_event = False
+                if now - self.last_show >= self.MIN_GAP:
+                    self.last_show = now
+                    return ("window", sig)
+            return None
+
+        prev = self.committed
+        self.committed = sig
+        self.window_event = False
+
+        if not self.ever:
+            self.ever = True
+            kind = "startup"
+        elif prev is None:
+            kind = "startup"
+        elif sig[3] != prev[3] or sig[0] != prev[0]:
+            kind = "mode"
+        elif sig[1] != prev[1] and None not in (sig[1], prev[1]):
+            kind = "full"
+        elif sig[2] != prev[2]:
+            kind = "caps"
+        else:
+            kind = ""
+
+        if not kind or not self._allowed(kind):
+            self.last_show = now if kind else self.last_show
+            return None
+        if now - self.last_show < self.MIN_GAP:
+            # 太密：吞掉这一下，但状态已经提交，不会过一会儿又补弹
+            return None
+        self.last_show = now
+        return (kind, sig)
+
+
+# ==========================================================================
 # 主程序
 # ==========================================================================
 class App:
@@ -1503,15 +1979,16 @@ class App:
         if cfg.get("hook_hotkeys", True):
             self.hook = SwitchKeyHook(self.on_hotkey, self.on_shift_space)
         self.settings = None
-        self.last = None            # {"hwnd","cn","full","caps","langid"}
-        self.pending_win = None     # (hwnd, ts)：换窗口后的延迟确认
-        self.pending_full = None    # (bool, ts)：Shift+Space 推断出的全角状态
-        self.full_silent = False    # 推断过期时的静默修正，不要因此弹窗
+        self.last = None            # 上一次的 Reading（预览 / 日志用）
+        self.tr = StateTracker(cfg)
+        self.fw = FullWidthTracker(cfg, self._save_caps)
         self.fast_until = 0.0
         self.log_on = False
         self.running = True
-        self._fs = (0.0, False)
+        self._fs = (0.0, False, "no")
         self._log_bytes = 0
+        self._fail = 0              # 连续读不到的次数（用于失败退避）
+        self._hook_on = self.hook is not None
 
     # ---------- 日志 ----------
     def set_log(self, on):
@@ -1537,103 +2014,88 @@ class App:
 
     # ---------- 全屏 ----------
     def fullscreen_now(self):
+        """1 秒缓存：全屏判定要做 4 次窗口/显示器查询，别每轮都做"""
         now = time.time()
         if now - self._fs[0] < 1.0:
-            return self._fs[1]
-        fs = is_fullscreen_state(query_notification_state())
-        self._fs = (now, fs)
-        return fs
+            return self._fs[1], self._fs[2]
+        fs, why = detect_fullscreen()
+        self._fs = (now, fs, why)
+        return fs, why
+
+    def _save_caps(self, caps):
+        """学到"这个输入法报不报全角位"后落盘，下次启动不用重学"""
+        self.cfg["ime_caps"] = dict(caps)
+        save_config(self.cfg)
 
     # ---------- 采样 ----------
-    def _resolve_full(self, imm_full, langid):
-        """全角状态的兜底推断。
-
-        多数输入法会把全角位写进 IMM 转换模式，直接读即可。但有的（实测豆包）
-        切全角**不写这个位**，只能靠 Shift+Space 推断：按下后先按"翻转"显示，
-        若 1.2 秒内 IMM 给出了相同结果就认为推断正确、清掉推断；若 IMM 始终
-        没变，就继续用推断值，直到用户又按了一次。
-
-        **英语/其他语言的键盘没有全角概念**（那里 Shift+Space 就是打一个空格），
-        所以非中文布局一律返回 None，不显示角标，也不缓存任何推断值。
-        """
-        self.full_silent = False
-        if langid and not is_chinese_layout(langid):
-            if self.pending_full is not None:
-                # 从中文键盘切走了，残留的推断必须丢掉，而且不能算作"变化"
-                self.pending_full = None
-                self.full_silent = True
-            return None
-        g = self.pending_full
-        if g is None:
-            return imm_full
-        val, at = g
-        if imm_full is not None and imm_full == val:
-            self.pending_full = None        # IMM 确认了，收工
-            return imm_full
-        if time.time() - at > 1.2:
-            # 推断过期：回到真实读数，并且**不要**因此弹一次
-            self.pending_full = None
-            self.full_silent = True
-            return imm_full
-        return val
-
     def sample(self):
-        hwnd = foreground_window()
-        langid = foreground_langid(hwnd)
-        cn, full, ok = read_ime_state(hwnd)
-        full = self._resolve_full(full, langid)
-        caps = caps_lock_on() if self.cfg.get("show_on_caps_change") else False
-        return hwnd, cn, full, caps, langid, ok
+        r = read_state(foreground_window())
+        if r.ok:
+            r.caps = caps_lock_on() if self.cfg.get("show_on_caps_change") else False
+            self._fail = 0
+        else:
+            self._fail += 1
+        r.full = self.fw.resolve(r)
+        return r
 
     # ---------- 事件 ----------
     def on_hotkey(self):
+        # 钩子线程调用：只改一个标量，绝不做 I/O
+        if self._fs[1]:
+            # 全屏游戏里不加速轮询：加速的代价是每 20ms 往游戏线程塞两条
+            # 同步消息（实测游戏窗口每条 12~18ms），这正是"最低帧突然掉到
+            # 十几帧"的来源。60ms 一次已经够快。
+            return
         self.fast_until = time.time() + 0.9
 
     def on_shift_space(self):
-        """Shift+Space：全角切换。IMM 读不到就靠这里兜底
+        """Shift+Space：全角切换。IME 不上报全角位时靠这里推断
 
-        只对**中文键盘**生效。英语键盘根本没有全角这回事，那里的 Shift+Space
-        就是"打一个空格 + 切换半角"（很多输入法/编辑器还是这个语义），把
-        它当成切全角会显示一个并不存在的变化。
+        只对**中文键盘**生效。英语键盘没有全角这回事，那里的 Shift+Space
+        就是打一个空格，当成切全角会显示一个并不存在的变化。
         """
-        cur = self.last or {}
-        # 实时查一次语言：刚切到英语键盘时 self.last 还是 60ms 前的"中文"，
-        # 照旧值推断会闪一下根本不存在的变化。这里只调两个纯 API，不阻塞钩子。
         try:
             langid = foreground_langid(user32.GetForegroundWindow())
         except Exception:
             langid = 0
-        langid = langid or (cur.get("langid") or 0)
-        if not is_chinese_layout(langid):
-            self.pending_full = None
+        cur = self.last
+        if not is_chinese_layout(langid or (cur.langid if cur else 0)):
             return
-        self.fast_until = time.time() + 0.9
-        base = cur.get("full")
-        val = (not base) if base is not None else True
-        self.pending_full = (val, time.time())
-        if cur and self.cfg.get("show_on_fullwidth_change", True):
-            shown = dict(cur)
-            shown["full"] = val
+        if not self._fs[1]:
+            self.fast_until = time.time() + 0.9
+        base = cur if cur is not None else read_state()
+        val = self.fw.toggle(base)
+        if val is None:
+            return
+        if self.cfg.get("show_on_fullwidth_change", True):
+            shown = Reading(hwnd=base.hwnd, langid=base.langid, hkl=base.hkl,
+                            cn=base.cn, full=val, caps=base.caps,
+                            ok=True, source="infer", conv=base.conv,
+                            open_status=base.open_status)
+            self.last = shown
+            self.tr.note((shown.cn, shown.full, shown.caps, shown.langid),
+                         time.time())
             self.display(shown, "full")
 
     # ---------- 显示 ----------
     def display(self, cur, hl=""):
-        self.ui.show(cur.get("cn"), cur.get("full"), cur.get("caps", False),
-                     hl=(hl,) if hl else (), langid=cur.get("langid", 0))
+        self.ui.show(cur.cn, cur.full, cur.caps, hl=(hl,) if hl else (),
+                     langid=cur.langid)
 
     def refresh_now(self):
-        if self.last:
-            self.display(self.last, "")
+        """设置窗口里点「预览」：重新采一次再画，别画旧状态"""
+        r = self.sample()
+        if r.cn is None and self.last is not None:
+            r = self.last
+        self.last = r
+        self.tr.note((r.cn, r.full, r.caps, r.langid), time.time())
+        self.display(r, "")
 
     def preview_live(self, key):
         """设置窗口里拖动控件时的实时预览（不写盘）"""
         if key == "opacity":
             if self.ui.visible:
-                try:
-                    self.ui.root.attributes(
-                        "-alpha", float(self.cfg.get("opacity", 0.85)))
-                except Exception:
-                    pass
+                self.ui._apply_alpha()
         elif key == "margin_bottom":
             self.ui.place()
         elif key == "duration":
@@ -1656,10 +2118,7 @@ class App:
         self.ui.apply_transparent_bg()
         self.ui.place()
         if self.ui.visible:
-            try:
-                self.ui.root.attributes("-alpha", float(cfg.get("opacity", 0.85)))
-            except Exception:
-                pass
+            self.ui._apply_alpha()
             self.ui.reschedule_hide()
         self.tray.state.update(always=self.ui.always_on,
                                transparent=bool(cfg.get("transparent_bg")),
@@ -1667,77 +2126,102 @@ class App:
                                autostart=get_autostart())
 
     # ---------- 主循环 ----------
+    def _set_hook(self, on):
+        """全屏游戏里把全局键盘钩子卸掉。
+
+        WH_KEYBOARD_LL 是系统级钩子：每次按键，Windows 都要等我们的回调返回
+        才把键交给前台程序。平时无所谓，游戏里这就是实打实的输入延迟 ——
+        这也是"全屏时 UI 导致卡顿"的一部分。所以全屏期间一律不装。
+        """
+        if not self.hook:
+            return
+        if on == self._hook_on and (not on or self.hook.is_running()):
+            return
+        # 走到这里可能是：状态变了，或者钩子线程自己死了（Windows 因回调超时
+        # 会静默卸载），两种情况都要重新装一次。
+        try:
+            if on:
+                self.hook.start()
+            else:
+                self.hook.stop()
+        except Exception:
+            log_crash("键盘钩子", traceback.format_exc())
+            return
+        self._hook_on = on
+        self.log("键盘钩子 %s" % ("装上" if on else "卸掉"))
+
     def tick(self):
         delay = 60
         try:
             now = time.time()
             policy = self.cfg.get("fullscreen_policy", "pause")
-            if policy != "normal" and self.fullscreen_now():
+            prev_fs = self._fs[1]
+            fs, why = self.fullscreen_now()
+            if fs != prev_fs:
+                self.log("全屏 -> %s (%s)" % ("是" if fs else "否", why))
+            # 游戏里不做淡出：每一帧 alpha 变化都是一次 DWM 更新，
+            # 而这时游戏正处在"被合成"的临界点上，能省一次是一次。
+            self.ui.set_fade(not (fs and policy != "pause"))
+            self.ui._in_game = bool(fs)
+
+            if fs and policy != "normal":
                 if policy == "pause":
+                    # 完全静默：不采样、不碰 IMM、不重绘。游戏里这是唯一
+                    # 真正"零卡顿"的做法（实测跨进程读一次要 12~18ms）。
+                    if self.ui.visible:
+                        self.ui.hide_now()
+                    self._set_hook(False)
                     self.fast_until = 0
-                    delay = 500
+                    self.tr.soft_reset(now, grace=0.4)
+                    delay = 700
                     self._handle_cmds()
                     return
+                self._set_hook(False)
                 delay = 600
             else:
-                delay = 20 if now < self.fast_until else \
-                    max(20, int(self.cfg.get("poll_ms", 60)))
+                if prev_fs and not fs:
+                    self.tr.soft_reset(now, grace=0.4)
+                self._set_hook(bool(self.cfg.get("hook_hotkeys", True)))
+                base_poll = max(20, int(self.cfg.get("poll_ms", 60)))
+                if now < self.fast_until and not self._fail:
+                    delay = 20
+                else:
+                    delay = base_poll
+                    # 读不到就退避：别对无响应/受保护的目标每 60ms 撞一次
+                    if self._fail:
+                        delay = min(800, base_poll * (1 + min(self._fail, 6)))
 
-            hwnd, cn, full, caps, langid, ok = self.sample()
+            r = self.sample()
             self._handle_cmds()
 
-            cur = {"hwnd": hwnd, "cn": cn, "full": full, "caps": caps,
-                   "langid": langid}
-            prev = self.last
-            self.last = cur
+            # 目标响应慢（例如窗口化游戏里一次采样要 20~30ms）就自动降频，
+            # 否则 60ms 一轮里有一半时间在等跨进程消息，白白拖慢自己。
+            if r.ms > 10:
+                delay = max(delay, min(400, int(r.ms * 4)))
 
-            if prev is None:
-                if self.cfg.get("show_on_startup", True):
-                    self.display(cur, "mode")
-                    self.log("启动状态 -> %s" % self._fmt(cur))
-                return
+            if r.cn is None and self.last is not None:
+                # 这次没读到：保持旧值，只更新缓存。绝不因为"读不到"弹一次 ——
+                # 启动瞬间和游戏里的乱刷就是这么来的。
+                prev = self.last
+                r.cn = prev.cn
+                r.full = prev.full if r.full is None else r.full
+                r.ok = prev.ok
+                r.source = "stale"
+            self.last = r
 
-            if prev["hwnd"] != hwnd:
-                # 换窗口：状态变化是"该窗口自己的记忆"（Windows 每个窗口各记各的），
-                # 不是用户主动切换，所以默认不提示。
-                # 打开 show_on_window_change 后**每次换窗口都提示一次**（哪怕状态
-                # 没变），否则从中文记事本切到中文浏览器什么都不弹，看起来像没生效。
-                # 用 250ms 延迟确认：Alt+Tab 会连续产生好几个 hwnd，免得连弹。
-                if self.cfg.get("show_on_window_change"):
-                    self.pending_win = (hwnd, time.time())
-                return
-
-            # 换了窗口、并且新窗口已经稳定了 250ms 以上 → 提示一次
-            if self.pending_win:
-                win_hwnd, at = self.pending_win
-                if win_hwnd != hwnd:
-                    self.pending_win = None
-                elif time.time() - at >= 0.25:
-                    self.pending_win = None
-                    self.display(cur, "window")
-                    self.log("换窗口 -> %s" % self._fmt(cur))
-                    return
-
-            if cn != prev["cn"] and self.cfg.get("show_on_mode_change", True):
-                self.pending_win = None
-                self.display(cur, "mode")
-                self.log("%s -> %s" % (self._fmt(prev), self._fmt(cur)))
-            elif langid != prev["langid"] \
-                    and self.cfg.get("show_on_mode_change", True):
-                # 切了输入语言（中文键盘 ↔ 英语键盘），但输入法状态没变
-                self.pending_win = None
-                self.display(cur, "mode")
-                self.log("语言 %s -> %s" % (self._fmt(prev), self._fmt(cur)))
-            elif full != prev["full"] and full is not None \
-                    and prev["full"] is not None \
-                    and self.cfg.get("show_on_fullwidth_change", True) \
-                    and not self.full_silent:
-                self.display(cur, "full")
-                self.log("%s -> %s（全角）" % (self._fmt(prev), self._fmt(cur)))
-            elif caps != prev["caps"] and self.cfg.get("show_on_caps_change"):
-                self.display(cur, "caps")
-            elif self.ui.always_on and not self.ui.visible:
-                self.display(cur, "")
+            ev = self.tr.feed((r.cn, r.full, r.caps, r.langid), r.hwnd, now)
+            if ev:
+                kind, sig = ev
+                cur = Reading(hwnd=r.hwnd, langid=sig[3], hkl=r.hkl,
+                              cn=sig[0], full=sig[1], caps=sig[2],
+                              ok=True, source=r.source, ms=r.ms)
+                self.display(cur, "" if kind == "window" else kind)
+                self.log("%s -> %s" % (kind, self._fmt(cur)))
+            elif self.ui.always_on and not self.ui.visible \
+                    and self.tr.committed is not None:
+                # 常驻模式：等状态机提交过至少一次再画，否则第一帧会先闪一下
+                # 未经确认的原始读数，紧接着再被 startup 覆盖。
+                self.display(r, "")
         except Exception:
             log_crash("主循环", traceback.format_exc())
         finally:
@@ -1750,18 +2234,18 @@ class App:
 
     @staticmethod
     def _fmt(cur):
-        zh = is_chinese_layout(cur.get("langid") or 0)
-        cn = cur.get("cn")
+        zh = is_chinese_layout(cur.langid or 0)
+        cn = cur.cn
         if cn is True:
             s = "中文"
         elif cn is False:
             s = "英文(输入法内)" if zh else "英文(英语键盘)"
         else:
             s = "未知"
-        if cur.get("langid") and not zh:
+        if cur.langid and not zh:
             full = "无全角"
         else:
-            full = {True: "全角", False: "半角", None: "?"}[cur.get("full")]
+            full = {True: "全角", False: "半角", None: "?"}[cur.full]
         return "%s/%s" % (s, full)
 
     def _handle_cmds(self):
@@ -1829,11 +2313,12 @@ class App:
         os._exit(0)
 
     def run(self):
-        self.log("启动 v%s  轮询=%sms  全屏策略=%s"
+        self.log("启动 v%s  轮询=%sms  全屏策略=%s  钩子=%s"
                  % (VERSION, self.cfg.get("poll_ms"),
-                    self.cfg.get("fullscreen_policy")))
-        if self.cfg.get("always_on"):
-            self.ui.root.after(50, self.refresh_now)
+                    self.cfg.get("fullscreen_policy"),
+                    "开" if self.hook else "关"))
+        # 启动时不再额外 refresh_now：第一帧由 tick 的状态机在稳定后画一次，
+        # 否则会和 tick 抢着画，出现"刚启动闪两下"。
         self.ui.root.after(30, self.tick)
         self.ui.root.mainloop()
 
@@ -1843,38 +2328,59 @@ class App:
 # ==========================================================================
 def run_once():
     hwnd = foreground_window()
-    langid = foreground_langid(hwnd)
-    cn, full, ok = read_ime_state(hwnd)
-    if langid and not is_chinese_layout(langid):
-        fulltxt = "不适用（%s键盘没有全角）" % (lang_name(langid) or "该")
+    r = read_state(hwnd)
+    fw = FullWidthTracker(load_config(), None)
+    r.full = fw.resolve(r)
+    fs, why = detect_fullscreen(hwnd)
+    if r.langid and not is_chinese_layout(r.langid):
+        fulltxt = "不适用（%s键盘没有全角）" % (lang_name(r.langid) or "该")
     else:
-        fulltxt = {True: "是", False: "否", None: "?"}[full]
+        fulltxt = {True: "是", False: "否", None: "?"}[r.full]
     print("前台窗口: 0x%X  %s" % (hwnd or 0, window_class(hwnd) if hwnd else "-"))
-    print("输入语言: 0x%04X  %s" % (langid, lang_name(langid) or "未知"))
-    print("中文: %s   全角: %s   可靠: %s"
-          % ({True: "是", False: "否", None: "?"}[cn], fulltxt, ok))
+    print("输入语言: 0x%04X  %s   HKL=0x%08X" %
+          (r.langid, lang_name(r.langid) or "未知", r.hkl))
+    print("中文: %s   全角: %s   可靠: %s   来源: %s  耗时: %.2fms"
+          % ({True: "是", False: "否", None: "?"}[r.cn], fulltxt, r.ok,
+             r.source, r.ms))
+    if r.conv is not None:
+        print("IME 原始值: conv=0x%X  open=%s  FULLSHAPE(0x8)=%d"
+              % (r.conv, r.open_status, 1 if r.conv & IME_CMODE_FULLSHAPE else 0))
+    print("全屏判定: %s (%s)" % ("是" if fs else "否", why))
     print("大写锁定: %s" % ("开" if caps_lock_on() else "关"))
-    return 0 if ok else 1
+    return 0 if r.ok else 1
 
 
 def run_debug(secs=0):
-    """持续打印采样结果，用来确认检测链路是否正常"""
-    print("调试模式：切换输入法/中英文/全角/窗口，观察下面输出。Ctrl+C 结束。")
+    """持续打印采样结果（含 IME 原始值），用来确认检测链路是否正常"""
+    print("调试模式：切换输入法 / 中英文 / 全角 / 窗口，观察下面输出。")
+    print("全角那一行看 conv 的 0x8 位：按 Shift+Space 时它会变，说明这个输入法"
+          "会上报；一直不变就是不上报，靠推断。Ctrl+C 结束。\n")
+
+    def learned(caps):
+        print("        → 学到: %s" % caps, flush=True)
+
+    fw = FullWidthTracker(load_config(), learned)
     end = time.time() + secs if secs else 0
     last = None
     try:
         while True:
             hwnd = foreground_window()
-            langid = foreground_langid(hwnd)
-            cn, full, ok = read_ime_state(hwnd)
-            cur = (hwnd, cn, full, langid)
+            r = read_state(hwnd)
+            r.full = fw.resolve(r)
+            fs, why = detect_fullscreen(hwnd)
+            cur = (hwnd, r.cn, r.full, r.langid, r.conv)
             mark = "  <= 变化" if last is not None and cur != last else ""
-            print("[%s] hwnd=0x%X cls=%-22s 语言=%-4s 中文=%-4s 全角=%-4s ok=%s%s"
-                  % (time.strftime("%H:%M:%S"), hwnd or 0,
-                     (window_class(hwnd) or "-")[:22],
-                     lang_name(langid) or "?",
-                     {True: "是", False: "否", None: "?"}[cn],
-                     {True: "是", False: "否", None: "?"}[full], ok, mark),
+            bit = ("-" if r.conv is None
+                   else ("1" if r.conv & IME_CMODE_FULLSHAPE else "0"))
+            print("[%s] %-18s %-4s 中=%-3s 全=%-3s | conv=%-6s open=%-4s 0x8=%s"
+                  " | %-7s %5.2fms%s"
+                  % (time.strftime("%H:%M:%S"),
+                     (window_class(hwnd) or "-")[:18],
+                     lang_name(r.langid) or "?",
+                     {True: "是", False: "否", None: "?"}[r.cn],
+                     {True: "是", False: "否", None: "?"}[r.full],
+                     ("0x%X" % r.conv) if r.conv is not None else "-",
+                     r.open_status, bit, r.source, r.ms, mark),
                   flush=True)
             last = cur
             if end and time.time() > end:

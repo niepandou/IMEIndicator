@@ -1,15 +1,22 @@
 # ============================================================
 # IME Indicator — 入库前排除清单
-# 仓库里只应该有：源码、文档、示例配置、启动脚本
+#
+# 应该被提交的只有：
+#   ime_indicator.py  config.example.json  README.md  CHANGELOG.md
+#   LICENSE  .gitignore  .gitattributes
+#   StartIMEIndicator.bat  StartWithLog.bat  DemoHighlight.bat  _find_python.bat
+#
+# 其余一律在本文件里排除。
 # ============================================================
 
 # ---------- 运行时生成：个人配置与日志 ----------
-# config.json 是你自己的设置（停留时长、透明度、各个开关…），不要提交。
-# 想贡献默认值请改 config.example.json。
+# config.json 是你自己的设置（停留时长、透明度、开关、学到的 ime_caps），不要提交。
+# 想改默认值请改 config.example.json。
 config.json
 config.json.tmp
 config.json.*.bak
 *.bak
+*.tmp
 events.log
 crash.log
 *.log
@@ -35,6 +42,13 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
 
 # ---------- 打包 / 虚拟环境 ----------
 *.spec
@@ -48,6 +62,7 @@ ENV/
 # ---------- 编辑器 / 系统 ----------
 .vscode/
 .idea/
+*.code-workspace
 *.swp
 *.swo
 *~
@@ -58,3 +73,4 @@ desktop.ini
 # ---------- 其他 ----------
 *.orig
 *.rej
+*.lnk
