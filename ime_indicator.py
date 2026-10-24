@@ -42,7 +42,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 import tkinter.ttk as ttk
 
-VERSION = "8.3"
+VERSION = "8.3.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.abspath(__file__)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -856,7 +856,7 @@ class Indicator:
         self.visible = False
         self._geo = None          # 上一次的窗口几何，未变化就不再 SetWindowPos
         self._alpha = None        # 上一次设置的 alpha
-        self._fade = True         # 游戏里关掉淡出
+        self._use_fade = True     # 游戏里关掉淡出（注意别和 _fade() 方法重名）
         self._in_game = False     # 当前是否在全屏游戏里（决定用 game_duration）
         self._fixed_w = self._fixed_width()
         self.resize(self._fixed_w)
@@ -875,6 +875,7 @@ class Indicator:
                     self.root.deiconify()
                 if not self.visible:
                     self.root.attributes("-alpha", 0.0)
+                    self._alpha = 0.0    # 缓存跟着走，否则下次 show 会以为已经是 0.85
             elif not self.visible and self.root.state() != "withdrawn":
                 self.root.withdraw()
         except Exception:
@@ -937,7 +938,7 @@ class Indicator:
 
     def set_fade(self, on):
         """游戏里关掉淡出：每一帧 alpha 变化都是一次 DWM 更新"""
-        self._fade = bool(on)
+        self._use_fade = bool(on)
 
     def _apply_alpha(self):
         want = float(self.cfg.get("opacity", 0.85))
@@ -1097,7 +1098,7 @@ class Indicator:
         self.hide_job = None
         if self.always_on:
             return
-        if not getattr(self, "_fade", True):
+        if not getattr(self, "_use_fade", True):
             self.hide_now()
             return
         try:

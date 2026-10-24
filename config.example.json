@@ -1,5 +1,6 @@
 {
   "duration": 1.6,
+  "game_duration": 1.0,
   "always_on": false,
   "margin_bottom": 38,
   "opacity": 0.85,
